@@ -1,0 +1,4 @@
+Placer ici les fichiers fournis par l'enseignant :
+  - producer.py
+  - stations.json
+Le fichier trips_history.jsonl sera genere ici (etape 4 du fichier ETAPES.md).
