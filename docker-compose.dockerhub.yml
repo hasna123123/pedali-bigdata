@@ -1,0 +1,144 @@
+name: pedali
+
+# Meme image pour Master, Workers et Jupyter => memes versions Spark / Python partout
+# (evite l'erreur "Python in worker has different version than driver")
+x-spark-image: &spark-image jupyter/pyspark-notebook:spark-3.5.0
+
+x-spark-worker: &spark-worker
+  image: *spark-image
+  user: root
+  depends_on:
+    - spark-master
+  environment: &worker-env
+    SPARK_WORKER_CORES: "2"
+    SPARK_WORKER_MEMORY: "2g"
+  networks: [pedali-net]
+
+services:
+  # ---------- Kafka (mode KRaft, sans ZooKeeper) ----------
+  kafka:
+    image: apache/kafka:3.7.0
+    container_name: kafka
+    ports:
+      - "29092:29092"   # acces depuis la machine hote (producer.py)
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    networks: [pedali-net]
+
+  # Cree le topic "trips" avec 3 partitions puis s'arrete
+  kafka-init:
+    image: apache/kafka:3.7.0
+    container_name: kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+          --create --if-not-exists --topic trips --partitions 3 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic trips
+    networks: [pedali-net]
+
+  # ---------- MinIO (stockage objet S3) ----------
+  minio:
+    image: quay.io/minio/minio:latest
+    container_name: minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # API S3
+      - "9001:9001"   # Console web
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+    networks: [pedali-net]
+
+  # Cree le bucket "lake" et l'arborescence Bronze / Silver / Gold
+  minio-init:
+    image: quay.io/minio/mc:latest
+    container_name: minio-init
+    profiles: ["tools"]
+    depends_on:
+      - minio
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until mc alias set local http://minio:9000 minioadmin minioadmin; do
+          echo "MinIO pas pret, nouvelle tentative..."; sleep 2
+        done
+        mc mb --ignore-existing local/lake
+        for d in bronze/trips_raw bronze/history silver/trips_clean silver/trips_history \
+                 gold/kpi_city_10min gold/graph_analysis checkpoints reference; do
+          mc cp /dev/null local/lake/$$d/.keep
+        done
+        mc ls --recursive local/lake/
+    networks: [pedali-net]
+
+  # ---------- Spark standalone : 1 Master + 2 Workers ----------
+  spark-master:
+    image: *spark-image
+    container_name: spark-master
+    user: root
+    command: /usr/local/spark/bin/spark-class org.apache.spark.deploy.master.Master --host spark-master --port 7077 --webui-port 8080
+    ports:
+      - "8080:8080"   # Spark Master UI
+      - "7077:7077"
+    networks: [pedali-net]
+
+  spark-worker-1:
+    <<: *spark-worker
+    container_name: spark-worker-1
+    command: /usr/local/spark/bin/spark-class org.apache.spark.deploy.worker.Worker --webui-port 8081 spark://spark-master:7077
+    ports:
+      - "8081:8081"
+
+  spark-worker-2:
+    <<: *spark-worker
+    container_name: spark-worker-2
+    command: /usr/local/spark/bin/spark-class org.apache.spark.deploy.worker.Worker --webui-port 8081 spark://spark-master:7077
+    ports:
+      - "8082:8081"
+
+  # ---------- Jupyter + PySpark (Driver) ----------
+  jupyter:
+    image: *spark-image
+    container_name: jupyter
+    user: root
+    depends_on:
+      - spark-master
+    ports:
+      - "8888:8888"   # Jupyter
+      - "4040:4040"   # Spark UI de l'application (DAG, stages)
+    environment:
+      JUPYTER_TOKEN: pedali
+      GRANT_SUDO: "yes"
+    volumes:
+      - ./notebooks:/home/jovyan/work
+      - ./data:/home/jovyan/data
+    networks: [pedali-net]
+
+networks:
+  pedali-net:
+    name: pedali-net
+
+volumes:
+  minio-data:
